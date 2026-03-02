@@ -1,0 +1,12 @@
+Ignore image files
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.csv
+*.json
+ignore notebook files
+*.ipynb
+
+ignore test folder
+./test_parentdir/
