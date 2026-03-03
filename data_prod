@@ -147,13 +147,13 @@ def calculate_peak_statistics(x_data, y_data):
 
 
 #=======================================================================
-# Core: fit peaks AND valleys for a single channel
+# Core: fit single peak OR valley for a single channel
 #=======================================================================
 def _fit_features(x, y_smooth, y_norm, feature_type="peak",
-                  window_frac=0.05, min_x=0.0):
+                  window_frac=0.10, min_x=0.0):
     """
-    Locate peaks (or valleys) in *y_smooth*, fit a Gaussian around each,
-    and return a list of result dicts.
+    Locate the single most prominent peak (or valley) in *y_smooth*, fit a
+    Gaussian around it, and return a one-element list of result dicts.
 
     Parameters
     ----------
@@ -162,14 +162,20 @@ def _fit_features(x, y_smooth, y_norm, feature_type="peak",
     y_norm       : 1-D array  - normalised (or raw) counts used for fitting
     feature_type : "peak" | "valley"
     window_frac  : float      - half-window for local Gaussian fit as a
-                                fraction of the full x-range
+                                fraction of the full x-range (default ±10 %,
+                                i.e. ~5 % either side of the initial guess)
     min_x        : float      - ignore features at or below this x value
 
     Returns
     -------
-    list of dicts, one per detected feature
+    list of dicts — exactly one entry for the most prominent feature, or
+    an empty list if no qualifying feature is found.
     """
-    x_range  = x[-1] - x[0]
+
+    # Masking first 512 bins
+    x_masked = x[512:]
+    x_range  = x_masked[-1] - x_masked[0]
+
     half_win = max(x_range * window_frac, 3.0)   # at least ±3 bins
 
     # Invert signal for valleys so find_peaks works uniformly
@@ -181,31 +187,35 @@ def _fit_features(x, y_smooth, y_norm, feature_type="peak",
         distance=max(1, len(x) // 20),
     )
 
-    results = []
-    for rank, idx in enumerate(indices, start=1):
-        feat_x = x[idx]
-        if feat_x <= min_x:
-            continue
+    # Filter out features at or below min_x
+    valid_mask = x[indices] > min_x
+    indices    = indices[valid_mask]
 
-        # local fitting window
-        mask  = (x >= feat_x - half_win) & (x <= feat_x + half_win)
-        x_win = x[mask]
-        y_win = y_norm[mask]
+    if len(indices) == 0:
+        return []
 
-        mean, mean_err = calculate_peak_statistics(x_win, y_win)
+    # Select only the single most prominent feature (highest signal value)
+    best_idx = indices[np.argmax(signal[indices])]
+    feat_x   = x[best_idx]
 
-        results.append({
-            "feature_type":      feature_type,
-            "feature_rank":      rank,
-            "bin_index":         int(idx),
-            "smoothed_x":        float(feat_x),
-            "smoothed_y":        float(y_smooth[idx]),
-            "gaussian_mean":     mean,
-            "gaussian_mean_err": mean_err,
-            "n_fit_points":      int(mask.sum()),
-        })
+    # Local fitting window — ±window_frac of the full x-range (~5 % either side
+    # of the initial guess, giving ~10 % total span around the feature)
+    mask  = (x >= feat_x - half_win) & (x <= feat_x + half_win)
+    x_win = x[mask]
+    y_win = y_norm[mask]
 
-    return results
+    mean, mean_err = calculate_peak_statistics(x_win, y_win)
+
+    return [{
+        "feature_type":      feature_type,
+        "feature_rank":      1,
+        "bin_index":         int(best_idx),
+        "smoothed_x":        float(feat_x),
+        "smoothed_y":        float(y_smooth[best_idx]),
+        "gaussian_mean":     mean,
+        "gaussian_mean_err": mean_err,
+        "n_fit_points":      int(mask.sum()),
+    }]
 
 
 #=======================================================================
@@ -215,7 +225,7 @@ def analyse_amplitude_phs(digitiser_summary,
                            n_channels    = N_CHANNELS,
                            normalise     = NORMALISE,
                            output_dir    = OUTPUT_DIR,
-                           savgol_window = 11,
+                           savgol_window = 100,
                            savgol_poly   = 3,
                            min_x         = 0.0):
     """
@@ -223,14 +233,14 @@ def analyse_amplitude_phs(digitiser_summary,
       1. Load amplitude histogram CSV
       2. Optionally normalise by trigger_counter
       3. Smooth with Savitzky-Golay
-      4. Detect peaks and valleys, fit Gaussians, record errors
+      4. Detect single peak and single valley, fit Gaussians, record errors
       5. Write results to CSV files
 
     Output files (all written to *output_dir*)
     ──────────────────────────────────────────
-    daq{N}_ch{C}_peaks.csv        peak fits for digitiser N, channel C
-    daq{N}_ch{C}_valleys.csv      valley fits for digitiser N, channel C
-    daq{N}_all_channels.csv       combined peaks+valleys for digitiser N
+    daq{N}_ch{C}_peaks.csv        peak fit for digitiser N, channel C
+    daq{N}_ch{C}_valleys.csv      valley fit for digitiser N, channel C
+    daq{N}_all_channels.csv       combined peak+valley for digitiser N
     all_digitisers_summary.csv    one row per feature, every DAQ & channel
 
     CSV columns
@@ -291,7 +301,7 @@ def analyse_amplitude_phs(digitiser_summary,
             win = max(win, savgol_poly + 2)
             smooth = savgol_filter(normed, window_length=win, polyorder=savgol_poly)
 
-            # ── detect and fit features ───────────────────────────────
+            # ── detect and fit single peak and single valley ──────────
             peaks   = _fit_features(x, smooth, normed, "peak",   min_x=min_x)
             valleys = _fit_features(x, smooth, normed, "valley", min_x=min_x)
 
@@ -315,7 +325,9 @@ def analyse_amplitude_phs(digitiser_summary,
             pk_df.to_csv(pk_path, index=False)
             vl_df.to_csv(vl_path, index=False)
 
-            print(f"  ch{ch}: {len(pk_df)} peak(s), {len(vl_df)} valley/ies "
+            n_pk = len(pk_df)
+            n_vl = len(vl_df)
+            print(f"  ch{ch}: {n_pk} peak(s), {n_vl} valley/ies "
                   f"-> {pk_path.name}, {vl_path.name}")
 
         # ── per-digitiser combined CSV ────────────────────────────────
