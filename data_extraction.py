@@ -235,7 +235,7 @@ for d in digitiser_summary:
     print(f"  Amplitude Histogram: {d['amplitude_histogram']}")
     print("="* 50)
 
-    #=======================================================================
+#=======================================================================
 # Amplitude PHS Plotting — 4 Digitisers × 8 Channels (32-panel figure)
 #=======================================================================
 
@@ -331,6 +331,7 @@ def plot_amplitude_phs(digitiser_summary, n_channels=N_CHANNELS, normalise=True)
                         color=colour, linewidth=0.9)
                 ax.fill_between(bin_edges, counts, step="mid",
                                 color=colour, alpha=0.20)
+                ax.set_yscale("log")
                 ax.yaxis.set_tick_params(labelsize=6)
                 ax.xaxis.set_tick_params(labelsize=6)
 
@@ -339,7 +340,6 @@ def plot_amplitude_phs(digitiser_summary, n_channels=N_CHANNELS, normalise=True)
                         transform=ax.transAxes, fontsize=8, color="grey")
                 ax.set_xticks([])
                 ax.set_yticks([])
-                ax.set_ylimits(0, 1)  # default y-limits for empty plots
 
             # Column headers — top row only
             if row_idx == 0:
