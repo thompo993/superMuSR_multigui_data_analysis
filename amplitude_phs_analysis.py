@@ -31,7 +31,8 @@ def extract_daq_from_filename(filename):
     if last_char.isdigit() and 0 <= int(last_char) <= 4:
         return int(last_char)
     else:
-        print("Digitiser ID outside of expected range (0-4). Please check parent directory.")
+        print("Digitiser ID outside of expected range (0-4). "
+              "Please check parent directory.")
 
 
 def group_files_by_digitiser(parent_directory):
@@ -118,20 +119,20 @@ def build_digitiser_summary(groups):
 
 def load_amplitude_csv(filepath):
     """
-    Load amplitude histogram CSV — no header, column index = channel.
+    Load amplitude histogram CSV.
 
-    Handles two common file formats:
-      (a) Clean: 8 columns, no index  → col 0 = ch0 … col 7 = ch7
-      (b) With spurious pandas index: 9 columns, col 0 = row index,
-          col 1 = ch0 … col 8 = ch7.  Detected by the leading comma /
-          NaN in cell [0, 0] and dropped automatically.
+    Handles two formats:
+      (a) Clean 8-column file  — col 0 = ch0 … col 7 = ch7
+      (b) File saved with a pandas row-index (leading comma) — 9 columns,
+          col 0 is the spurious integer index, col 1..8 are the channels.
+          Detected by NaN in cell [0,0] AND a monotonically non-decreasing
+          all-integer first column; dropped automatically.
     """
     df = pd.read_csv(filepath, header=None, encoding="utf-8")
 
-    # --- Detect & drop spurious row-index column ---
-    # Symptom: first cell is NaN (blank before a leading comma)
+    # Detect & drop spurious row-index column
     if df.shape[1] > 1 and pd.isna(df.iloc[0, 0]):
-        candidate = df.iloc[1:, 0]          # skip the NaN header cell
+        candidate = df.iloc[1:, 0]
         floated   = pd.to_numeric(candidate, errors="coerce").dropna()
         if len(floated) > 0:
             is_monotone = bool((floated.diff().dropna() >= 0).all())
@@ -139,35 +140,97 @@ def load_amplitude_csv(filepath):
             if is_monotone and is_integers:
                 df = df.iloc[:, 1:].reset_index(drop=True)
 
-    # --- Drop first row if it is the artefact header (all-NaN or all-zero) ---
-    first_row_numeric = pd.to_numeric(df.iloc[0], errors="coerce")
-    if first_row_numeric.isna().all() or (first_row_numeric.fillna(0) == 0).all():
+    # Drop first row if it is all-NaN or all-zero (header artefact)
+    first_row = pd.to_numeric(df.iloc[0], errors="coerce")
+    if first_row.isna().all() or (first_row.fillna(0) == 0).all():
         df = df.iloc[1:].reset_index(drop=True)
 
     return df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
 
 #=======================================================================
-# Gaussian fit
+# Gaussian fit with linear background subtraction
 #=======================================================================
 def gaussian(x, amplitude, mean, sigma):
     return amplitude * np.exp(-(x - mean) ** 2 / (2 * sigma ** 2))
 
 
-def fit_gaussian_window(x_win, y_win):
+def fit_gaussian_bg_subtracted(x_win, y_raw_win, feat_x, est_width):
     """
-    Fit a Gaussian to a local window.
-    Returns (mean, mean_err) or (None, None).
-    Rejects fits whose mean falls outside the x window (unphysical result).
+    Fit a Gaussian to a peak after subtracting a linear background.
+
+    The background is estimated by drawing a straight line between the
+    left and right edges of the fitting window.  The Gaussian is then
+    fitted to the background-subtracted raw counts.
+
+    Parameters
+    ----------
+    x_win     : 1-D array — x values inside the fitting window
+    y_raw_win : 1-D array — raw (or normalised) counts inside the window
+    feat_x    : float     — initial guess for the peak centre
+    est_width : float     — estimated half-width (e.g. from find_peaks widths)
+
+    Returns
+    -------
+    (mean, mean_err) or (None, None) on failure.
     """
-    valid = y_win > 0
-    xv, yv = x_win[valid], y_win[valid]
-    if len(xv) < 4:
+    if len(x_win) < 4:
         return None, None
+
+    # Linear background from window edges
+    bg_slope     = (float(y_raw_win[-1]) - float(y_raw_win[0])) / \
+                   max(float(x_win[-1] - x_win[0]), 1.0)
+    bg_intercept = float(y_raw_win[0]) - bg_slope * float(x_win[0])
+    background   = bg_slope * x_win + bg_intercept
+
+    y_signal = y_raw_win.astype(float) - background
+    y_signal = np.maximum(y_signal, 0.0)
+
+    valid = y_signal > 0
+    if valid.sum() < 4:
+        return None, None
+
+    xv, yv = x_win[valid], y_signal[valid]
     x_lo, x_hi = float(xv[0]), float(xv[-1])
+
     try:
-        p0 = [float(np.max(yv)), float(xv[np.argmax(yv)]),
-              max((x_hi - x_lo) / 4.0, 1.0)]
+        p0 = [float(np.max(yv)), feat_x, max(float(est_width), 2.0)]
+        popt, pcov = curve_fit(gaussian, xv, yv, p0=p0, maxfev=10000)
+        mean = float(popt[1])
+        # Reject unphysical fits
+        if not (x_lo <= mean <= x_hi):
+            return None, None
+        var      = float(pcov[1, 1])
+        mean_err = float(np.sqrt(var)) if var >= 0 else None
+        return mean, mean_err
+    except (RuntimeError, ValueError):
+        return None, None
+
+
+#=======================================================================
+# Valley Gaussian fit (no background subtraction — valley is a dip)
+#=======================================================================
+def fit_gaussian_valley(x_win, y_raw_win, feat_x, est_width):
+    """
+    Fit a Gaussian to the inverted signal around a valley (dip).
+    Uses the background-subtracted inverted counts.
+    """
+    if len(x_win) < 4:
+        return None, None
+
+    # Invert: turn the dip into a bump
+    y_inv = -y_raw_win.astype(float)
+    y_inv -= y_inv.min()           # shift so minimum is zero
+
+    valid = y_inv > 0
+    if valid.sum() < 4:
+        return None, None
+
+    xv, yv = x_win[valid], y_inv[valid]
+    x_lo, x_hi = float(xv[0]), float(xv[-1])
+
+    try:
+        p0 = [float(np.max(yv)), feat_x, max(float(est_width), 2.0)]
         popt, pcov = curve_fit(gaussian, xv, yv, p0=p0, maxfev=10000)
         mean = float(popt[1])
         if not (x_lo <= mean <= x_hi):
@@ -185,57 +248,108 @@ def fit_gaussian_window(x_win, y_win):
 def _fit_features(x, y_smooth, y_norm, feature_type="peak",
                   window_frac=0.10, min_x=0.0):
     """
-    Locate the single most prominent peak (or valley) in y_smooth and fit
-    a Gaussian around it.
+    Find the single most prominent peak (or valley) and fit a Gaussian.
+
+    Peak fitting
+    ------------
+    Uses a linear background subtraction before fitting so that peaks
+    sitting on a steeply falling Compton continuum are located accurately.
+    The fitting window half-width is set to 4× the half-prominence width
+    returned by find_peaks (physics-driven), capped at 200 bins.
+
+    If no interior peak is found by find_peaks (e.g. the photopeak is
+    below the ADC threshold and only its falling edge is visible), the
+    global maximum of the smoothed spectrum is used as the peak location.
 
     Valley robustness
     -----------------
     A valley is only accepted if its smoothed count exceeds 0.5 % of the
-    spectrum maximum.  This prevents the noise floor at the far end of the
-    spectrum from being mis-labelled as a valley.
+    spectrum maximum, preventing the noise floor at the far end of the
+    array from being mis-labelled as a valley.
 
     Returns
     -------
-    list containing at most one feature dict, or [] if none found.
+    list with at most one feature dict, or [] if none found.
     """
     n = len(x)
     if n < 5:
         return []
 
-    x_range  = float(x[-1] - x[0])
-    half_win = max(x_range * window_frac, 3.0)
-
-    # Invert for valley detection
     signal = -y_smooth if feature_type == "valley" else y_smooth
 
     sig_range  = float(signal.max() - signal.min())
-    prominence = max(sig_range * 0.02, 1e-12)   # ≥ 2 % of dynamic range
+    prominence = max(sig_range * 0.02, 1e-12)
     min_dist   = max(2, n // 20)
 
-    indices, _ = find_peaks(signal, prominence=prominence, distance=min_dist)
+    indices, props = find_peaks(
+        signal,
+        prominence=prominence,
+        distance=min_dist,
+        width=1,          # always request width so props['widths'] exists
+        rel_height=0.5,
+    )
 
     # Drop features at or below min_x
     if len(indices):
-        indices = indices[x[indices] > min_x]
+        keep = x[indices] > min_x
+        indices = indices[keep]
+        for key in props:
+            if hasattr(props[key], '__len__') and len(props[key]) == len(keep):
+                props[key] = props[key][keep]
 
-    # For valleys: reject candidates on the noise floor (< 0.5 % of max)
+    # Valley: reject noise-floor hits
     if feature_type == "valley" and len(indices):
         floor_threshold = float(y_smooth.max()) * 0.005
-        indices = indices[y_smooth[indices] > floor_threshold]
+        keep = y_smooth[indices] > floor_threshold
+        indices = indices[keep]
+        for key in props:
+            if hasattr(props[key], '__len__') and len(props[key]) == len(keep):
+                props[key] = props[key][keep]
 
-    if len(indices) == 0:
-        return []
+    # ------------------------------------------------------------------
+    # Peak fallback: if find_peaks found nothing, use the global maximum.
+    # This handles spectra where the photopeak is partially or fully below
+    # the ADC threshold (only the falling right-hand edge is visible).
+    # ------------------------------------------------------------------
+    fallback_peak = False
+    if feature_type == "peak" and len(indices) == 0:
+        best_idx     = int(np.argmax(signal))
+        est_width    = max(float(n) * 0.03, 5.0)   # rough 3 % of spectrum
+        fallback_peak = True
+    else:
+        if len(indices) == 0:
+            return []
+        # Select the most prominent feature
+        best_idx  = int(indices[np.argmax(signal[indices])])
+        est_width = float(props["widths"][np.argmax(signal[indices])])
 
-    # Single most prominent feature
-    best_idx = int(indices[np.argmax(signal[indices])])
-    feat_x   = float(x[best_idx])
+    feat_x = float(x[best_idx])
 
-    # Local fitting window
-    mask  = (x >= feat_x - half_win) & (x <= feat_x + half_win)
+    # ------------------------------------------------------------------
+    # Build fitting window
+    #   • peaks   : 4× half-prominence width, capped at 200 bins
+    #   • valleys : 4× width, capped at 200 bins
+    # For fallback peaks (edge maximum) use right-side only.
+    # ------------------------------------------------------------------
+    half_win = min(est_width * 4.0, 200.0)
+    half_win = max(half_win, 5.0)
+
+    if fallback_peak:
+        # Only right-side window available
+        mask = (x >= feat_x) & (x <= feat_x + half_win)
+    else:
+        mask = (x >= feat_x - half_win) & (x <= feat_x + half_win)
+
     x_win = x[mask]
     y_win = y_norm[mask]
 
-    mean, mean_err = fit_gaussian_window(x_win, y_win)
+    # ------------------------------------------------------------------
+    # Gaussian fit
+    # ------------------------------------------------------------------
+    if feature_type == "peak":
+        mean, mean_err = fit_gaussian_bg_subtracted(x_win, y_win, feat_x, est_width)
+    else:
+        mean, mean_err = fit_gaussian_valley(x_win, y_win, feat_x, est_width)
 
     return [{
         "feature_type":      feature_type,
@@ -246,6 +360,7 @@ def _fit_features(x, y_smooth, y_norm, feature_type="peak",
         "gaussian_mean":     mean,
         "gaussian_mean_err": mean_err,
         "n_fit_points":      int(mask.sum()),
+        "fallback":          fallback_peak if feature_type == "peak" else False,
     }]
 
 
@@ -264,15 +379,22 @@ def analyse_amplitude_phs(digitiser_summary,
       1. Load amplitude histogram CSV (auto-detects spurious index column)
       2. Optionally normalise by trigger_counter
       3. Trim leading zero-bins; smooth with Savitzky-Golay
-      4. Detect single peak and single valley; fit Gaussians
+      4. Detect single peak and single valley; fit Gaussians with
+         linear background subtraction for accurate centre estimation
       5. Write per-channel, per-digitiser, and master CSV files
 
     Output files (written to *output_dir*)
     ───────────────────────────────────────
-    daq{N}_ch{C}_peaks.csv        peak fit for digitiser N, channel C
-    daq{N}_ch{C}_valleys.csv      valley fit for digitiser N, channel C
-    daq{N}_all_channels.csv       combined peak+valley for digitiser N
-    all_digitisers_summary.csv    one row per feature, every DAQ & channel
+    daq{N}_ch{C}_peaks.csv
+    daq{N}_ch{C}_valleys.csv
+    daq{N}_all_channels.csv
+    all_digitisers_summary.csv
+
+    CSV columns
+    ───────────
+    digitiser_id | channel | normalised | norm_factor | feature_type |
+    feature_rank | bin_index | smoothed_x | smoothed_y | gaussian_mean |
+    gaussian_mean_err | n_fit_points | fallback
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -331,21 +453,19 @@ def analyse_amplitude_phs(digitiser_summary,
             x_a      = x_full[start:]
             normed_a = normed[start:]
 
-            # ── Savitzky-Golay smooth ─────────────────────────────────
+            # Savitzky-Golay smooth
             win = min(savgol_window, len(normed_a) - 1)
             if win % 2 == 0:
                 win -= 1
-            win = max(win, savgol_poly + 2)
+            win      = max(win, savgol_poly + 2)
             smooth_a = savgol_filter(normed_a, window_length=win,
                                      polyorder=savgol_poly)
 
-            # ── detect & fit ──────────────────────────────────────────
-            peaks   = _fit_features(x_a, smooth_a, normed_a, "peak",
-                                    window_frac=0.10, min_x=min_x)
-            valleys = _fit_features(x_a, smooth_a, normed_a, "valley",
-                                    window_frac=0.10, min_x=min_x)
+            # Detect & fit
+            peaks   = _fit_features(x_a, smooth_a, normed_a, "peak",   min_x=min_x)
+            valleys = _fit_features(x_a, smooth_a, normed_a, "valley", min_x=min_x)
 
-            # Remap indices from the trimmed array back to full coordinates
+            # Remap trimmed-array coordinates → full-array coordinates
             for feat_list in (peaks, valleys):
                 for feat in feat_list:
                     feat["bin_index"]  = int(feat["bin_index"]  + start)
@@ -353,32 +473,40 @@ def analyse_amplitude_phs(digitiser_summary,
                     if feat["gaussian_mean"] is not None:
                         feat["gaussian_mean"] = float(feat["gaussian_mean"] + start)
 
-            # ── assemble rows ─────────────────────────────────────────
+            # Assemble rows
             base    = {"digitiser_id": dig_id, "channel": ch,
                        "normalised": norm_applied, "norm_factor": norm_factor}
             ch_rows = [{**base, **f} for f in peaks + valleys]
             dig_rows.extend(ch_rows)
             all_rows.extend(ch_rows)
 
-            # ── per-channel CSVs ──────────────────────────────────────
+            # Per-channel CSVs
             pk_df = pd.DataFrame([r for r in ch_rows if r["feature_type"] == "peak"])
             vl_df = pd.DataFrame([r for r in ch_rows if r["feature_type"] == "valley"])
-
             pk_path = output_dir / f"daq{dig_id}_ch{ch}_peaks.csv"
             vl_path = output_dir / f"daq{dig_id}_ch{ch}_valleys.csv"
             pk_df.to_csv(pk_path, index=False)
             vl_df.to_csv(vl_path, index=False)
 
-            print(f"  ch{ch}: {len(pk_df)} peak(s), {len(vl_df)} valley/ies "
-                  f"→ {pk_path.name}, {vl_path.name}")
+            # Diagnostic print
+            pk_info = ""
+            if len(pk_df):
+                r    = pk_df.iloc[0]
+                gm   = f"{r['gaussian_mean']:.1f}" if pd.notna(r.get('gaussian_mean')) else "no fit"
+                fb   = " [fallback]" if r.get('fallback') else ""
+                pk_info = f"peak@{r['bin_index']}(gaus={gm}){fb}"
+            vl_info = ""
+            if len(vl_df):
+                r    = vl_df.iloc[0]
+                gm   = f"{r['gaussian_mean']:.1f}" if pd.notna(r.get('gaussian_mean')) else "no fit"
+                vl_info = f"valley@{r['bin_index']}(gaus={gm})"
+            print(f"  ch{ch}: {pk_info or 'NO PEAK'}, {vl_info or 'no valley'}")
 
-        # ── per-digitiser combined CSV ────────────────────────────────
         if dig_rows:
             dig_path = output_dir / f"daq{dig_id}_all_channels.csv"
             pd.DataFrame(dig_rows).to_csv(dig_path, index=False)
             print(f"[DAQ {dig_id}] Combined CSV → {dig_path.name}")
 
-    # ── master summary CSV ────────────────────────────────────────────
     if all_rows:
         master_path = output_dir / "all_digitisers_summary.csv"
         pd.DataFrame(all_rows).to_csv(master_path, index=False)
