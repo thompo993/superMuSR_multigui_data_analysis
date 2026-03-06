@@ -23,7 +23,7 @@ NORMALISE  = True
 
 
 #=======================================================================
-# helper functions (unchanged)
+# helper functions
 #=======================================================================
 def extract_daq_from_filename(filename):
     stem = Path(str(filename)).stem
@@ -117,110 +117,131 @@ def build_digitiser_summary(groups):
 
 
 def load_amplitude_csv(filepath):
-    """Load amplitude histogram CSV — no header, column index = channel."""
-    return pd.read_csv(filepath, header=None, encoding="utf-8")
+    """
+    Load amplitude histogram CSV — no header, column index = channel.
+
+    Handles two common file formats:
+      (a) Clean: 8 columns, no index  → col 0 = ch0 … col 7 = ch7
+      (b) With spurious pandas index: 9 columns, col 0 = row index,
+          col 1 = ch0 … col 8 = ch7.  Detected by the leading comma /
+          NaN in cell [0, 0] and dropped automatically.
+    """
+    df = pd.read_csv(filepath, header=None, encoding="utf-8")
+
+    # --- Detect & drop spurious row-index column ---
+    # Symptom: first cell is NaN (blank before a leading comma)
+    if df.shape[1] > 1 and pd.isna(df.iloc[0, 0]):
+        candidate = df.iloc[1:, 0]          # skip the NaN header cell
+        floated   = pd.to_numeric(candidate, errors="coerce").dropna()
+        if len(floated) > 0:
+            is_monotone = bool((floated.diff().dropna() >= 0).all())
+            is_integers = bool((floated % 1 == 0).all())
+            if is_monotone and is_integers:
+                df = df.iloc[:, 1:].reset_index(drop=True)
+
+    # --- Drop first row if it is the artefact header (all-NaN or all-zero) ---
+    first_row_numeric = pd.to_numeric(df.iloc[0], errors="coerce")
+    if first_row_numeric.isna().all() or (first_row_numeric.fillna(0) == 0).all():
+        df = df.iloc[1:].reset_index(drop=True)
+
+    return df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
 
 #=======================================================================
-# Gaussian / fit functions
+# Gaussian fit
 #=======================================================================
 def gaussian(x, amplitude, mean, sigma):
-    """Gaussian: amplitude * exp(-(x-mean)^2 / (2*sigma^2))"""
-    return amplitude * np.exp(-(x - mean)**2 / (2 * sigma**2))
+    return amplitude * np.exp(-(x - mean) ** 2 / (2 * sigma ** 2))
 
 
-def calculate_peak_statistics(x_data, y_data):
+def fit_gaussian_window(x_win, y_win):
     """
-    Fit a Gaussian to (x_data, y_data) and return (mean, mean_error).
-    Returns (None, None) if the fit cannot be performed.
+    Fit a Gaussian to a local window.
+    Returns (mean, mean_err) or (None, None).
+    Rejects fits whose mean falls outside the x window (unphysical result).
     """
-    valid = y_data > 0
-    xv, yv = x_data[valid], y_data[valid]
-    if len(xv) < 3:
+    valid = y_win > 0
+    xv, yv = x_win[valid], y_win[valid]
+    if len(xv) < 4:
         return None, None
+    x_lo, x_hi = float(xv[0]), float(xv[-1])
     try:
-        p0 = [np.max(yv), xv[np.argmax(yv)], max((xv[-1] - xv[0]) / 4, 1.0)]
+        p0 = [float(np.max(yv)), float(xv[np.argmax(yv)]),
+              max((x_hi - x_lo) / 4.0, 1.0)]
         popt, pcov = curve_fit(gaussian, xv, yv, p0=p0, maxfev=10000)
-        mean_err = float(np.sqrt(pcov[1, 1])) if pcov[1, 1] >= 0 else None
-        return float(popt[1]), mean_err
+        mean = float(popt[1])
+        if not (x_lo <= mean <= x_hi):
+            return None, None
+        var      = float(pcov[1, 1])
+        mean_err = float(np.sqrt(var)) if var >= 0 else None
+        return mean, mean_err
     except (RuntimeError, ValueError):
         return None, None
 
 
 #=======================================================================
-# Core: find single most-prominent peak OR valley, fit Gaussian
+# Feature detection — single peak OR valley per channel
 #=======================================================================
 def _fit_features(x, y_smooth, y_norm, feature_type="peak",
                   window_frac=0.10, min_x=0.0):
     """
-    Locate the single most prominent peak (or valley) in y_smooth, fit a
-    Gaussian around it, and return a one-element list of result dicts.
+    Locate the single most prominent peak (or valley) in y_smooth and fit
+    a Gaussian around it.
 
-    For valleys the signal is inverted before peak-finding so that local
-    minima (dips between a peak and the noise floor) are detected reliably.
-
-    Parameters
-    ----------
-    x            : 1-D array  — bin indices
-    y_smooth     : 1-D array  — Savitzky-Golay smoothed counts
-    y_norm       : 1-D array  — normalised (or raw) counts used for fitting
-    feature_type : "peak" | "valley"
-    window_frac  : float      — half-window for Gaussian fit as a fraction
-                                of the full x-range (default ±10 %)
-    min_x        : float      — ignore features at or below this x value
+    Valley robustness
+    -----------------
+    A valley is only accepted if its smoothed count exceeds 0.5 % of the
+    spectrum maximum.  This prevents the noise floor at the far end of the
+    spectrum from being mis-labelled as a valley.
 
     Returns
     -------
-    list of dicts — one entry for the most prominent feature, or [] if none.
+    list containing at most one feature dict, or [] if none found.
     """
     n = len(x)
     if n < 5:
         return []
 
     x_range  = float(x[-1] - x[0])
-    half_win = max(x_range * window_frac, 3.0)   # at least ±3 bins
+    half_win = max(x_range * window_frac, 3.0)
 
-    # Invert for valleys so find_peaks works uniformly
+    # Invert for valley detection
     signal = -y_smooth if feature_type == "valley" else y_smooth
 
-    # Minimum peak height: 5 % of the signal range (above the baseline)
-    sig_min  = signal.min()
-    sig_range = signal.max() - sig_min
-    min_height = sig_min + sig_range * 0.05
+    sig_range  = float(signal.max() - signal.min())
+    prominence = max(sig_range * 0.02, 1e-12)   # ≥ 2 % of dynamic range
+    min_dist   = max(2, n // 20)
 
-    # Minimum separation: 5 % of total bins, at least 2
-    min_dist = max(2, n // 20)
+    indices, _ = find_peaks(signal, prominence=prominence, distance=min_dist)
 
-    indices, _ = find_peaks(
-        signal,
-        height=min_height,
-        distance=min_dist,
-    )
-
-    # Filter features at or below min_x
+    # Drop features at or below min_x
     if len(indices):
-        valid_mask = x[indices] > min_x
-        indices    = indices[valid_mask]
+        indices = indices[x[indices] > min_x]
+
+    # For valleys: reject candidates on the noise floor (< 0.5 % of max)
+    if feature_type == "valley" and len(indices):
+        floor_threshold = float(y_smooth.max()) * 0.005
+        indices = indices[y_smooth[indices] > floor_threshold]
 
     if len(indices) == 0:
         return []
 
-    # Keep only the single most prominent feature
-    best_idx = indices[np.argmax(signal[indices])]
-    feat_x   = x[best_idx]
+    # Single most prominent feature
+    best_idx = int(indices[np.argmax(signal[indices])])
+    feat_x   = float(x[best_idx])
 
     # Local fitting window
     mask  = (x >= feat_x - half_win) & (x <= feat_x + half_win)
     x_win = x[mask]
     y_win = y_norm[mask]
 
-    mean, mean_err = calculate_peak_statistics(x_win, y_win)
+    mean, mean_err = fit_gaussian_window(x_win, y_win)
 
     return [{
         "feature_type":      feature_type,
         "feature_rank":      1,
         "bin_index":         int(best_idx),
-        "smoothed_x":        float(feat_x),
+        "smoothed_x":        feat_x,
         "smoothed_y":        float(y_smooth[best_idx]),
         "gaussian_mean":     mean,
         "gaussian_mean_err": mean_err,
@@ -240,24 +261,18 @@ def analyse_amplitude_phs(digitiser_summary,
                            min_x         = 0.0):
     """
     For every digitiser × channel:
-      1. Load amplitude histogram CSV
+      1. Load amplitude histogram CSV (auto-detects spurious index column)
       2. Optionally normalise by trigger_counter
-      3. Smooth with Savitzky-Golay
-      4. Detect single peak and single valley, fit Gaussians, record errors
-      5. Write results to CSV files
+      3. Trim leading zero-bins; smooth with Savitzky-Golay
+      4. Detect single peak and single valley; fit Gaussians
+      5. Write per-channel, per-digitiser, and master CSV files
 
-    Output files (all written to *output_dir*)
-    ──────────────────────────────────────────
+    Output files (written to *output_dir*)
+    ───────────────────────────────────────
     daq{N}_ch{C}_peaks.csv        peak fit for digitiser N, channel C
     daq{N}_ch{C}_valleys.csv      valley fit for digitiser N, channel C
     daq{N}_all_channels.csv       combined peak+valley for digitiser N
     all_digitisers_summary.csv    one row per feature, every DAQ & channel
-
-    CSV columns
-    ───────────
-    digitiser_id | channel | feature_type | feature_rank | bin_index |
-    smoothed_x   | smoothed_y | gaussian_mean | gaussian_mean_err |
-    n_fit_points | normalised | norm_factor
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -270,16 +285,18 @@ def analyse_amplitude_phs(digitiser_summary,
         amp_file        = entry["amplitude_histogram"]
         trigger_counter = entry["trigger_counter"]
 
-        # ── normalisation factor ─────────────────────────────────────
-        norm_factor = 1.0
+        # ── normalisation ────────────────────────────────────────────
+        norm_factor  = 1.0
+        norm_applied = False
         if normalise and trigger_counter is not None:
             try:
                 nf = float(trigger_counter)
-                norm_factor = nf if nf > 0 else 1.0
+                if nf > 0:
+                    norm_factor  = nf
+                    norm_applied = True
             except (ValueError, TypeError):
                 print(f"  [DAQ {dig_id}] Cannot convert trigger_counter "
                       f"'{trigger_counter}' to float — skipping normalisation.")
-        norm_applied = norm_factor != 1.0
 
         # ── load CSV ─────────────────────────────────────────────────
         if amp_file is None:
@@ -288,7 +305,7 @@ def analyse_amplitude_phs(digitiser_summary,
         try:
             df = load_amplitude_csv(amp_file)
             print(f"[DAQ {dig_id}] Loaded {amp_file.name} "
-                  f"({df.shape[0]} bins x {df.shape[1]} channels)")
+                  f"({df.shape[0]} bins × {df.shape[1]} channels)")
         except Exception as exc:
             print(f"[DAQ {dig_id}] Failed to read amplitude CSV: {exc}")
             continue
@@ -297,60 +314,49 @@ def analyse_amplitude_phs(digitiser_summary,
 
         for ch in range(n_channels):
             if ch >= df.shape[1]:
-                print(f"  [DAQ {dig_id}] Channel {ch} not present — skipping.")
+                print(f"  [DAQ {dig_id}] ch{ch}: not present — skipping.")
                 continue
 
             raw    = df.iloc[:, ch].values.astype(float)
             normed = raw / norm_factor
-            x      = np.arange(len(normed), dtype=float)
+            x_full = np.arange(len(normed), dtype=float)
 
-            # ── skip leading zero-rows ────────────────────────────────
-            # Find the first non-zero bin so the SG filter and peak finder
-            # operate on the meaningful part of the spectrum only.
+            # Trim leading zeros
             nonzero = np.where(normed > 0)[0]
             if len(nonzero) == 0:
                 print(f"  [DAQ {dig_id}] ch{ch}: all zeros — skipping.")
                 continue
-            start = nonzero[0]
+            start = int(nonzero[0])
 
-            x_active      = x[start:]
-            normed_active = normed[start:]
+            x_a      = x_full[start:]
+            normed_a = normed[start:]
 
             # ── Savitzky-Golay smooth ─────────────────────────────────
-            win = min(savgol_window, len(normed_active) - 1)
+            win = min(savgol_window, len(normed_a) - 1)
             if win % 2 == 0:
                 win -= 1
             win = max(win, savgol_poly + 2)
-            smooth_active = savgol_filter(
-                normed_active, window_length=win, polyorder=savgol_poly
-            )
+            smooth_a = savgol_filter(normed_a, window_length=win,
+                                     polyorder=savgol_poly)
 
-            # ── detect and fit single peak and single valley ──────────
-            peaks   = _fit_features(
-                x_active, smooth_active, normed_active,
-                "peak",   window_frac=0.10, min_x=min_x,
-            )
-            valleys = _fit_features(
-                x_active, smooth_active, normed_active,
-                "valley", window_frac=0.10, min_x=min_x,
-            )
+            # ── detect & fit ──────────────────────────────────────────
+            peaks   = _fit_features(x_a, smooth_a, normed_a, "peak",
+                                    window_frac=0.10, min_x=min_x)
+            valleys = _fit_features(x_a, smooth_a, normed_a, "valley",
+                                    window_frac=0.10, min_x=min_x)
 
-            # Re-map bin indices back to the original (full) coordinate system
+            # Remap indices from the trimmed array back to full coordinates
             for feat_list in (peaks, valleys):
                 for feat in feat_list:
-                    feat["bin_index"] = int(feat["bin_index"] + start)
+                    feat["bin_index"]  = int(feat["bin_index"]  + start)
                     feat["smoothed_x"] = float(feat["smoothed_x"] + start)
                     if feat["gaussian_mean"] is not None:
                         feat["gaussian_mean"] = float(feat["gaussian_mean"] + start)
 
             # ── assemble rows ─────────────────────────────────────────
-            base = {
-                "digitiser_id": dig_id,
-                "channel":      ch,
-                "normalised":   norm_applied,
-                "norm_factor":  norm_factor,
-            }
-            ch_rows = [{**base, **feat} for feat in peaks + valleys]
+            base    = {"digitiser_id": dig_id, "channel": ch,
+                       "normalised": norm_applied, "norm_factor": norm_factor}
+            ch_rows = [{**base, **f} for f in peaks + valleys]
             dig_rows.extend(ch_rows)
             all_rows.extend(ch_rows)
 
@@ -363,22 +369,20 @@ def analyse_amplitude_phs(digitiser_summary,
             pk_df.to_csv(pk_path, index=False)
             vl_df.to_csv(vl_path, index=False)
 
-            n_pk = len(pk_df)
-            n_vl = len(vl_df)
-            print(f"  ch{ch}: {n_pk} peak(s), {n_vl} valley/ies "
-                  f"-> {pk_path.name}, {vl_path.name}")
+            print(f"  ch{ch}: {len(pk_df)} peak(s), {len(vl_df)} valley/ies "
+                  f"→ {pk_path.name}, {vl_path.name}")
 
         # ── per-digitiser combined CSV ────────────────────────────────
         if dig_rows:
             dig_path = output_dir / f"daq{dig_id}_all_channels.csv"
             pd.DataFrame(dig_rows).to_csv(dig_path, index=False)
-            print(f"[DAQ {dig_id}] Combined CSV -> {dig_path.name}")
+            print(f"[DAQ {dig_id}] Combined CSV → {dig_path.name}")
 
     # ── master summary CSV ────────────────────────────────────────────
     if all_rows:
         master_path = output_dir / "all_digitisers_summary.csv"
         pd.DataFrame(all_rows).to_csv(master_path, index=False)
-        print(f"\nMaster summary -> {master_path}")
+        print(f"\nMaster summary → {master_path}")
 
     print("\nAnalysis complete.")
 

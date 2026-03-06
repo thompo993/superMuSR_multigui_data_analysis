@@ -359,7 +359,7 @@ def plot_amplitude_phs(digitiser_summary, n_channels=N_CHANNELS, normalise=True)
         fontsize=13, fontweight="bold", y=1.01,
     )
     plt.tight_layout()
-    plt.savefig("amplitude_phs_all.png", dpi=150, bbox_inches="tight")
+    plt.savefig("amplitude_phs_all.png_test.png", dpi=150, bbox_inches="tight")
     print("\nFigure saved → amplitude_phs_all.png")
     plt.show()
 

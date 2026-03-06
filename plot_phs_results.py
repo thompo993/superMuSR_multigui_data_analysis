@@ -1,7 +1,7 @@
 #=======================================================================
 # plot_phs_results.py
 # Reads CSVs produced by amplitude_phs_analysis.py and plots all
-# 32 channels (4 DAQs x 8 channels) in a single figure, overlaying
+# channels (n_digs × n_channels) in a single figure, overlaying
 # detected peak / valley positions with Gaussian-fit error bands.
 #=======================================================================
 import numpy as np
@@ -12,10 +12,10 @@ from matplotlib.lines import Line2D
 from pathlib import Path
 
 #=======================================================================
-# inputs  -- edit these to match your setup
+# inputs — edit these to match your setup
 #=======================================================================
-RESULTS_DIR   = r"./data"      # folder written by analysis script
-RAW_DATA_DIR  = r"./test_parent_dir" # original amplitude CSVs (for spectrum)
+RESULTS_DIR   = r"./data"
+RAW_DATA_DIR  = r"./test_parent_dir"
 OUTPUT_FIGURE = r"./phs_all_channels.png"
 
 N_CHANNELS = 8
@@ -25,13 +25,12 @@ LOG_SCALE    = True
 SHOW_PEAKS   = True
 SHOW_VALLEYS = True
 
-# One colour per channel, consistent across all DAQ rows
 CH_COLOURS = [
     "#ffff00", "#ff0000", "#00ff00", "#0000ff",
     "#00ffff", "#ff00ff", "#ffffff", "#ffa500",
 ]
-PEAK_COLOUR   = "#E63946"   # red  — peaks
-VALLEY_COLOUR = "#457B9D"   # blue — valleys
+PEAK_COLOUR   = "#E63946"
+VALLEY_COLOUR = "#457B9D"
 
 
 #=======================================================================
@@ -51,14 +50,39 @@ def load_spectrum(raw_data_dir, dig_id):
     if not candidates:
         return None
     try:
-        return pd.read_csv(candidates[0], header=None, encoding="utf-8")
+        return _load_amplitude_csv(candidates[0])
     except Exception as exc:
         print(f"  Could not load spectrum for DAQ {dig_id}: {exc}")
         return None
 
 
+def _load_amplitude_csv(filepath):
+    """
+    Mirror of load_amplitude_csv() in the analysis script.
+    Handles spurious pandas row-index column (leading comma in CSV).
+    """
+    df = pd.read_csv(filepath, header=None, encoding="utf-8")
+
+    # Detect & drop spurious index column
+    if df.shape[1] > 1 and pd.isna(df.iloc[0, 0]):
+        candidate = df.iloc[1:, 0]
+        floated   = pd.to_numeric(candidate, errors="coerce").dropna()
+        if len(floated) > 0:
+            is_monotone = bool((floated.diff().dropna() >= 0).all())
+            is_integers = bool((floated % 1 == 0).all())
+            if is_monotone and is_integers:
+                df = df.iloc[:, 1:].reset_index(drop=True)
+
+    # Drop all-NaN or all-zero first row
+    first_row = pd.to_numeric(df.iloc[0], errors="coerce")
+    if first_row.isna().all() or (first_row.fillna(0) == 0).all():
+        df = df.iloc[1:].reset_index(drop=True)
+
+    return df.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+
 def load_fit_results(results_dir, dig_id, ch, feature_type):
-    """Load daq{N}_ch{C}_{peaks|valleys}.csv — returns empty DataFrame if missing."""
+    """Load daq{N}_ch{C}_{peaks|valleys}.csv; returns empty DataFrame if missing."""
     path = Path(results_dir) / f"daq{dig_id}_ch{ch}_{feature_type}.csv"
     if not path.exists():
         return pd.DataFrame()
@@ -97,6 +121,12 @@ def _nan(val):
         return True
 
 
+def _first_nonzero(arr):
+    """Return index of first non-zero element, or 0 if none."""
+    nz = np.where(arr > 0)[0]
+    return int(nz[0]) if len(nz) else 0
+
+
 #=======================================================================
 # main plotting function
 #=======================================================================
@@ -123,7 +153,6 @@ def plot_all_channels(
     n_digs = len(daq_ids)
     print(f"Found DAQ IDs: {daq_ids}")
 
-    # ── figure / axes ────────────────────────────────────────────────
     fig, axes = plt.subplots(
         nrows=n_digs, ncols=n_channels,
         figsize=(n_channels * 3.0, n_digs * 2.6),
@@ -155,11 +184,21 @@ def plot_all_channels(
             # ── spectrum ─────────────────────────────────────────────
             plotted = False
             if spec_df is not None and ch < spec_df.shape[1]:
-                raw     = spec_df.iloc[:, ch].values.astype(float)
-                counts  = raw / norm_factor if (normalise and norm_factor != 1.0) else raw
-                bins    = np.arange(len(counts), dtype=float)
-                display = np.where(counts > 0, counts, np.nan)
+                raw    = spec_df.iloc[:, ch].values.astype(float)
+                counts = raw / norm_factor if (normalise and norm_factor != 1.0) else raw
+                bins   = np.arange(len(counts), dtype=float)
 
+                # ── FIX: zoom x-axis to the active (non-zero) region ──
+                start = _first_nonzero(counts)
+                end   = int(np.where(counts > 0)[0][-1]) + 1 if np.any(counts > 0) else len(counts)
+                # Add a small margin (5 % of the active range)
+                span   = max(end - start, 1)
+                margin = max(int(span * 0.05), 2)
+                x_lo   = max(0, start - margin)
+                x_hi   = min(len(counts) - 1, end + margin)
+                ax.set_xlim(x_lo, x_hi)
+
+                display = np.where(counts > 0, counts, np.nan)
                 ax.step(bins, display, where="mid",
                         color=colour, linewidth=0.85, alpha=0.9)
                 ax.fill_between(bins, display, step="mid",
@@ -167,9 +206,9 @@ def plot_all_channels(
 
                 if log_scale:
                     ax.set_yscale("log")
-                    ax.yaxis.set_major_locator(
-                        ticker.LogLocator(base=10, numticks=4))
+                    ax.yaxis.set_major_locator(ticker.LogLocator(base=10, numticks=4))
                     ax.yaxis.set_minor_locator(ticker.NullLocator())
+
                 plotted = True
 
             if not plotted:
@@ -181,16 +220,17 @@ def plot_all_channels(
             if show_peaks:
                 pk_df = load_fit_results(results_dir, dig_id, ch, "peaks")
                 for _, row in pk_df.iterrows():
+                    # Prefer gaussian_mean; fall back to smoothed_x
                     gx  = row.get("gaussian_mean")
                     gxe = row.get("gaussian_mean_err")
-                    if _nan(gx):           # fall back to smoothed position
+                    if _nan(gx):
                         gx, gxe = row.get("smoothed_x"), None
                     if not _nan(gx):
                         ax.axvline(gx, color=PEAK_COLOUR,
-                                   linewidth=0.9, linestyle="--", alpha=0.75)
+                                   linewidth=0.9, linestyle="--", alpha=0.85)
                         if not _nan(gxe):
                             ax.axvspan(gx - gxe, gx + gxe,
-                                       color=PEAK_COLOUR, alpha=0.15, linewidth=0)
+                                       color=PEAK_COLOUR, alpha=0.18, linewidth=0)
 
             # ── valley overlays ──────────────────────────────────────
             if show_valleys:
@@ -202,10 +242,10 @@ def plot_all_channels(
                         gx, gxe = row.get("smoothed_x"), None
                     if not _nan(gx):
                         ax.axvline(gx, color=VALLEY_COLOUR,
-                                   linewidth=0.9, linestyle=":", alpha=0.75)
+                                   linewidth=0.9, linestyle=":", alpha=0.85)
                         if not _nan(gxe):
                             ax.axvspan(gx - gxe, gx + gxe,
-                                       color=VALLEY_COLOUR, alpha=0.13, linewidth=0)
+                                       color=VALLEY_COLOUR, alpha=0.15, linewidth=0)
 
             # ── labels ───────────────────────────────────────────────
             if row_idx == 0:
@@ -227,9 +267,9 @@ def plot_all_channels(
     fig.legend(
         handles=[
             Line2D([0], [0], color=PEAK_COLOUR,   linewidth=1.3, linestyle="--",
-                   label="Peak  (Gaussian mean +/- 1 sigma)"),
+                   label="Peak  (Gaussian mean ± 1σ)"),
             Line2D([0], [0], color=VALLEY_COLOUR, linewidth=1.3, linestyle=":",
-                   label="Valley (Gaussian mean +/- 1 sigma)"),
+                   label="Valley (Gaussian mean ± 1σ)"),
         ],
         loc="lower center", ncol=2, fontsize=8,
         facecolor="#161B22", edgecolor="#30363D", labelcolor="#C9D1D9",
@@ -239,7 +279,7 @@ def plot_all_channels(
     plt.tight_layout(rect=[0, 0.02, 1, 1])
     plt.savefig(output_figure, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    print(f"\nFigure saved -> {output_figure}")
+    print(f"\nFigure saved → {output_figure}")
     plt.show()
 
 
