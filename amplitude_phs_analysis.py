@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 #=======================================================================
 # inputs
 #=======================================================================
-parent_dir = r"./test_parent_dir"
+parent_dir = r"./test_parent_dir_1"
 OUTPUT_DIR = r"./data"
 N_CHANNELS = 8
 NORMALISE  = True

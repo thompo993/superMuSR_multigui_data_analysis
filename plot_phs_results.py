@@ -15,8 +15,8 @@ from pathlib import Path
 # inputs — edit these to match your setup
 #=======================================================================
 RESULTS_DIR   = r"./data"
-RAW_DATA_DIR  = r"./test_parent_dir"
-OUTPUT_FIGURE = r"./phs_all_channels.png"
+RAW_DATA_DIR  = r"./test_parent_dir_1"
+OUTPUT_FIGURE = r"./phs_all_channels_4.png"
 
 N_CHANNELS = 8
 NORMALISE  = True    # must match what was used in the analysis script
@@ -164,7 +164,8 @@ def plot_all_channels(
         axes = np.array([axes])
     if n_channels == 1:
         axes = axes[:, np.newaxis]
-
+    peaks = []
+    valleys = []
     for row_idx, dig_id in enumerate(daq_ids):
 
         spec_df     = load_spectrum(raw_data_dir, dig_id)
@@ -217,6 +218,7 @@ def plot_all_channels(
                         color="#484F58", fontstyle="italic")
 
             # ── peak overlays ────────────────────────────────────────
+            pk_df = pd.DataFrame()
             if show_peaks:
                 pk_df = load_fit_results(results_dir, dig_id, ch, "peaks")
                 for _, row in pk_df.iterrows():
@@ -233,6 +235,7 @@ def plot_all_channels(
                                        color=PEAK_COLOUR, alpha=0.18, linewidth=0)
 
             # ── valley overlays ──────────────────────────────────────
+            vl_df = pd.DataFrame()
             if show_valleys:
                 vl_df = load_fit_results(results_dir, dig_id, ch, "valleys")
                 for _, row in vl_df.iterrows():
@@ -246,6 +249,43 @@ def plot_all_channels(
                         if not _nan(gxe):
                             ax.axvspan(gx - gxe, gx + gxe,
                                        color=VALLEY_COLOUR, alpha=0.15, linewidth=0)
+
+            # ── Peak to Valley Ratio ──────────────────────────────────────────────
+            if show_peaks and show_valleys and not pk_df.empty and not vl_df.empty:
+                # Get all valid peak/valley positions (prefer gaussian_mean, fall back to smoothed_x)
+                def _get_positions(df):
+                    pos = []
+                    for _, r in df.iterrows():
+                        x = r.get("gaussian_mean")
+                        if _nan(x):
+                            x = r.get("smoothed_x")
+                        if not _nan(x):
+                            pos.append(float(x))
+                    return pos
+
+                peak_positions   = _get_positions(pk_df)
+                valley_positions = _get_positions(vl_df)
+
+                if peak_positions and valley_positions and spec_df is not None and ch < spec_df.shape[1]:
+                    raw    = spec_df.iloc[:, ch].values.astype(float)
+                    counts = raw / norm_factor if (normalise and norm_factor != 1.0) else raw
+
+                    def _counts_at(x):
+                        """Return counts at the nearest bin to position x."""
+                        idx = int(round(x))
+                        idx = max(0, min(idx, len(counts) - 1))
+                        return counts[idx]
+
+                    for pk_x in peak_positions:
+                        # Pair each peak with the nearest valley
+                        nearest_valley = min(valley_positions, key=lambda v: abs(v - pk_x))
+                        pk_val  = _counts_at(pk_x)
+                        vl_val  = _counts_at(nearest_valley)
+                        ratio   = pk_val / vl_val if vl_val > 0 else float("inf")
+                        print(f"  DAQ {dig_id:>2}  Ch {ch}  |  "
+                              f"Peak @ bin {pk_x:.1f} ({pk_val:.2f} counts)  /  "
+                              f"Valley @ bin {nearest_valley:.1f} ({vl_val:.2f} counts)  "
+                              f"==>  P/V ratio: {ratio:.3f}")
 
             # ── labels ───────────────────────────────────────────────
             if row_idx == 0:
